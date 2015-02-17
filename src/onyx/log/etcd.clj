@@ -44,15 +44,15 @@
       (String. "UTF-8")))
 
 (defn deserialize [x]
-  (-> x
+  (some-> x
       (.getBytes "UTF-8")
       b64/decode
       fressian/read))
 
+
 (defn initialize-origin! [config prefix]
   (let [node (str (origin-path prefix) "/origin")
-        bytes (serialize {:message-id 1
-                          :replica {:job-scheduler (:onyx.peer/job-scheduler config)}})]
+        bytes (serialize {:message-id 1 :replica {}})]
     (etcd/set node bytes)))
 
 
@@ -66,13 +66,12 @@
                          :recursive recursive
                          :wait-index wait-index
                          :callback (fn [newval]
-                                      (put! ch true)
-                                      (cb newval)))
-            [v ch] (alts! [ch exit-chan])]
+                                      (put! ch (cb newval))))
+            [continue? ch] (alts! [ch exit-chan])]
       (if (= ch exit-chan)
-;        (prn f)
         (future-cancel f)
-        (recur (-> @f :node :modifiedIndex inc)))))
+        (when continue?
+          (recur (-> @f :node :modifiedIndex inc))))))
     exit-chan))
 
 (defrecord Etcd [config]
@@ -82,7 +81,8 @@
     (taoensso.timbre/info "Starting Etcd")
     (let [onyx-id (:onyx/id config)]
       ; (when-let [etcd-config (:etcd/address config)]
-      ;   (etcd/connect! etcd-config))
+                                        ;   (etcd/connect! etcd-config))
+      (etcd/set-default-timeout! 20000)
       (etcd/mkdir root-path)
       (etcd/mkdir (prefix-path onyx-id))
       (etcd/mkdir (pulse-path onyx-id))
@@ -95,11 +95,14 @@
       (etcd/mkdir (job-scheduler-path onyx-id))
 
       (initialize-origin! config onyx-id)
-      (assoc component :subscribers (atom []) :prefix onyx-id)))
+      (assoc component :subscribers (atom []) :wait-futures (atom []) :prefix onyx-id)))
 
   (stop [component]
     (doseq [subscriber @(:subscribers component)]
       (close! subscriber))
+
+    (doseq [f @(:wait-futures component)]
+      (future-cancel f))
 
     component))
 
@@ -118,6 +121,9 @@
   (let [node (str (log-path prefix) "/" position)
         data (etcd/sget node)
         content (deserialize data)]
+    (when (nil? content)
+      (taoensso.timbre/error "Try to read deleted or not existing log " position)
+      (throw (ex-info "Log not found" {:position position})))
     (assoc content :message-id position :created-at (:ctime (:stat data)))))
 
 (defmethod extensions/register-pulse Etcd
@@ -126,23 +132,27 @@
     (etcd/set node id :ttl 5)
     (go-loop []
       (let [resp (etcd/set node id :ttl 5 :prev-exist true)]
-        (<! (timeout 3500))
+        (<! (timeout 4000))
         (when-not (contains? resp :errorCode)
           (recur))))))
 
 (defmethod extensions/on-delete Etcd
   [{:keys [opts prefix subscribers] :as log} id ch]
   (let [f (fn [newvalue]
-            (when (nil? (-> newvalue :node :value))
-              (>!! ch true)))
+            (if (nil? (-> newvalue :node :value))
+              (do
+                (>!! ch true)
+                false)
+              true))
         path (str (pulse-path prefix) "/" id)
         pulse (etcd/get path)]
     (try
       (if-not (-> pulse :node :value)
         (>!! ch true)
-        (swap! subscribers conj (etcd-subscribe path f
-                                                :start-index (-> pulse :node :createdIndex)
-                                                )))
+        (swap! subscribers
+               conj (etcd-subscribe path f
+                               :start-index (-> pulse :node :modifiedIndex inc)
+                               )))
       (catch Exception e
         ;; Node doesn't exist.
         (>!! ch true)))))
@@ -161,15 +171,16 @@
           (recur)))))
 
 (defmethod extensions/subscribe-to-log Etcd
-  [{:keys [opts prefix] :as log} ch]
+  [{:keys [opts prefix subscribers] :as log} ch]
   (try
     (let [job-scheduler (find-job-scheduler log)
           origin (extensions/read-chunk log :origin nil)]
-      (swap! subscribers conj (etcd-subscribe (log-path prefix) 
-                      (fn [value] (>!! ch (-> value :node :createdIndex)))
-                      :start-index (-> (etcd/get (log-path prefix))
-                                       :node :modifiedIndex inc)
-                      :recursive true))
+      (swap! subscribers conj
+             (etcd-subscribe (log-path prefix) 
+                             (fn [value] (>!! ch (-> value :node :createdIndex)) true)
+                             :start-index (-> (etcd/get (log-path prefix))
+                                              :node :modifiedIndex inc)
+                             :recursive true))
       (assoc (:replica origin) :job-scheduler job-scheduler))
     (catch Exception e
       (fatal e))))
@@ -241,8 +252,13 @@
         version (-> (etcd/get node) :node :modifiedIndex)
         content (deserialize (etcd/sget node))]
     (when (< (:message-id content) message-id)
-      (let [new-content {:message-id message-id :replica replica}]
-        (etcd/set node (serialize new-content) :prev-index version)))))
+      (let [new-content {:message-id message-id :replica replica}
+            resp (etcd/set node (serialize new-content) :prev-index version)]
+        (when (contains? resp :errorCode)
+          (taoensso.timbre/error "Update failed " resp)
+          (throw (ex-info "update failed" resp)))
+        new-content
+        ))))
 
 (defmethod extensions/gc-log-entry Etcd
   [{:keys [opts prefix] :as log} position]
